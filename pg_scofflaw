@@ -2,7 +2,7 @@
 """
 Custom authentication proxy for PostgreSQL.
 
-Usage: pg_scofflaw [--upstream <server:port/socket file> --listen <ip:port> --auth-script <script> --ssl <certfile> --timeout <length> --max-chain <size> --verbosity <loglevel>]
+Usage: pg_scofflaw [--upstream <server:port/socket file> --listen <ip:port> --auth-script <script> --ssl <certfile> --timeout <length> --max-chain <size> --verbosity <loglevel> --trace]
 
 Options:
   --upstream <server:port/socket file>  PostgreSQL server to proxy [default: /var/run/postgresql/.s.PGSQL.5432]
@@ -14,6 +14,7 @@ Options:
   --timeout <length>                    Time to live in seconds [default: 3600] 
   --max-chain <size>                    Maximum message chain size in bytes [default: 10000000]
   --verbosity <loglevel>                Amount of detail to output [default: INFO]
+  --trace                               Log each message received from client and postgres , including message type,size. 
 """
 
 from docopt import docopt
@@ -43,6 +44,8 @@ to_byte_type =      lambda format, value: struct.pack( format, value )
 from_int32_be =     lambda buffer: from_byte_type( '>i', 4, buffer )
 to_int32_be =       lambda value: to_byte_type( '>i', value )
 
+trace = False
+
 
 def authenticate(auth_script, host, role, db):
     return subprocess.call([auth_script, host, role, db]) == 0
@@ -55,7 +58,7 @@ def gen_fatal(message):
 def pipe_request(socks, ssl_cert, auth_script, max_chain):
     auth_mode = True
 
-    proc_id = '({}) {}'.format(id(getcurrent()), socks['client'].getpeername())
+    proc_id = 'Request<{}> {}'.format(id(getcurrent()), socks['client'].getpeername())
     input_buf = bytearray()
     while True:
         try:
@@ -98,6 +101,7 @@ def pipe_request(socks, ssl_cert, auth_script, max_chain):
                     elif msg[:4] == TOKEN_CANCEL_REQUEST:
                         logging.debug('{}: CancelRequest detected; passing on'.format(proc_id))
                         socks['server'].send(data)
+                        break;
 
                     else:   # play dumb and eat the handshake request if using an older protocol
                         logging.error('{}: no idea what this is!'.format(proc_id))
@@ -106,13 +110,13 @@ def pipe_request(socks, ssl_cert, auth_script, max_chain):
                         logging.debug('({}) pg_scofflaw: {}'.format(id(getcurrent()), error_full))
                     
             else:
-                if pull_entire_message(socks['client'], input_buf, max_chain):
+                if pull_entire_message(proc_id,socks['client'], input_buf, max_chain):
                     if not input_buf:
                         # empty message
                         logging.debug('{}: empty message'.format(proc_id))
                         break
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug('{}: {}'.format(proc_id, repr(input_buf)))
+                        logging.debug('{}: send message to server (size = {})'.format(proc_id, repr(input_buf)))
                     socks['server'].sendall(input_buf)
                 else:
                     logging.error('{}: unknown message! {}'.format(proc_id, input_buf))
@@ -122,17 +126,17 @@ def pipe_request(socks, ssl_cert, auth_script, max_chain):
 
 
 def pipe_response(socks, max_chain):
-    proc_id = '({}) {}'.format(id(getcurrent()), socks['server'].getpeername())
+    proc_id = 'Response<{}> {}'.format(id(getcurrent()), socks['server'].getpeername())
     input_buf = bytearray()
     while True:
         try:
-            if pull_entire_message(socks['server'], input_buf, max_chain):
+            if pull_entire_message(proc_id,socks['server'], input_buf, max_chain):
                 if not input_buf:
                     # empty message
                     logging.debug('{}: empty message'.format(proc_id))
-                    break
+                    break;
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
-                    logging.debug('{}: {}'.format(proc_id, repr(input_buf)))
+                    logging.debug('{}: send message to client (size = {})'.format(proc_id, len(input_buf)))
                 socks['client'].sendall(input_buf)
             else:
                 logging.error('{}: unknown message! {}'.format(proc_id, input_buf))
@@ -145,12 +149,19 @@ def pipe_response(socks, max_chain):
 # if next_size is defined, ask for [size+next_size] bytes, but return 1 if only [size]
 # bytes come back. otherwise return 2, to indicate message chainloading.
 # return 0 if zero-length message was received (EOL)
-def fill_buffer(sock, buffer, offset, size, next_size=0):
+def fill_buffer(proc_id,sock, buffer, offset, size, next_size=0):
     remainder = size+next_size
     buffer_view = memoryview(buffer)
     tries = 0
     while remainder > 0:
         rem_size = sock.recv_into(buffer_view[offset+size+next_size-remainder:], remainder)
+        if trace and rem_size > 0:
+            if offset == 0:
+                logging.debug('{}: received message header (type = {}, data size = {}, total message size = {})'.format(proc_id,chr(buffer_view[0]),struct.unpack('!i',buffer_view[1:5])[0] - 4,offset + rem_size))
+            elif remainder > 0 and remainder == rem_size and next_size > 0:
+                logging.debug('{}: received message data (data size = {}) and next message header with type (type = {}, data size = {}, total message size = {})'.format(proc_id,remainder - next_size,chr(buffer_view[-5]),struct.unpack('!i',buffer_view[-4:])[0] - 4,offset + rem_size))
+            else:
+                logging.debug('{}: received message data, (data size = {}, total message size = {})'.format(proc_id,rem_size,offset + rem_size))
         remainder -= rem_size
         if (rem_size == 0 and tries == 0):# or (tries > FILL_BUFFER_MAX_RETRIES):
             # give up
@@ -164,11 +175,11 @@ def fill_buffer(sock, buffer, offset, size, next_size=0):
 
 
 # pulls postgresql messages from socket with automatic chainloading
-def pull_entire_message(sock, buffer, max_chain):
+def pull_entire_message(proc_id,sock, buffer, max_chain):
     start_offset = 0
     buffer.clear()
     buffer.extend(MESSAGE_HEADER_SIZE*b'\x00')
-    if fill_buffer(sock, buffer, start_offset, MESSAGE_HEADER_SIZE):  # we got a header's worth of bytes
+    if fill_buffer(proc_id,sock, buffer, start_offset, MESSAGE_HEADER_SIZE):  # we got a header's worth of bytes
         while True:
             if buffer[start_offset] in MESSAGE_TOKENS:
                 message_size = from_int32_be( buffer[start_offset+1:start_offset+5] )+1
@@ -180,7 +191,7 @@ def pull_entire_message(sock, buffer, max_chain):
                 
                 # only attempt a message chainload if we're out of buffer space
                 next_size = 0 if (len(buffer) > max_chain) else MESSAGE_HEADER_SIZE
-                result = fill_buffer(sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=next_size)
+                result = fill_buffer(proc_id,sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=next_size)
                 if result == 2:
                     # more messages, chainload!
                     start_offset += message_size
@@ -211,6 +222,7 @@ if __name__ == '__main__':
     listen = (listen[0], int(listen[1]) if (len(listen)>1) else 6000)
     ssl_cert = args['--ssl']
     auth_script = args['--auth-script']
+    trace = args['--trace']
 
     logging.basicConfig(
         level=args['--verbosity'].upper(),
@@ -218,7 +230,7 @@ if __name__ == '__main__':
     )
 
     def create_pg_socket():
-        if os.path.exists(upstream):
+        if isinstance(upstream,str) and os.path.exists(upstream):
             pg_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             pg_socket.connect(upstream)
         else:
