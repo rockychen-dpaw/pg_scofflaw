@@ -2,7 +2,7 @@
 """
 Custom authentication proxy for PostgreSQL.
 
-Usage: pg_scofflaw [--upstream <server:port/socket file> --listen <ip:port> --auth-script <script> --ssl <certfile> --timeout <length> --verbosity <loglevel>]
+Usage: pg_scofflaw [--upstream <server:port/socket file> --listen <ip:port> --auth-script <script> --ssl <certfile> --timeout <length> --max-chain <size> --verbosity <loglevel>]
 
 Options:
   --upstream <server:port/socket file>  PostgreSQL server to proxy [default: /var/run/postgresql/.s.PGSQL.5432]
@@ -12,6 +12,7 @@ Options:
                                         [default: true]
   --ssl <certfile>                      Accept SSL requests (TLSv1)
   --timeout <length>                    Time to live in seconds [default: 3600] 
+  --max-chain <size>                    Maximum message chain size in bytes [default: 10000000]
   --verbosity <loglevel>                Amount of detail to output [default: INFO]
 """
 
@@ -51,7 +52,7 @@ def gen_fatal(message):
     error_full = b'E' + to_int32_be(len(error_body)+4) + error_body
     return error_full
 
-def pipe_request(socks, ssl_cert, auth_script):
+def pipe_request(socks, ssl_cert, auth_script, max_chain):
     auth_mode = True
 
     proc_id = '({}) {}'.format(id(getcurrent()), socks['client'].getpeername())
@@ -105,7 +106,7 @@ def pipe_request(socks, ssl_cert, auth_script):
                         logging.debug('({}) pg_scofflaw: {}'.format(id(getcurrent()), error_full))
                     
             else:
-                if pull_entire_message(socks['client'], input_buf):
+                if pull_entire_message(socks['client'], input_buf, max_chain):
                     if not input_buf:
                         # empty message
                         logging.debug('{}: empty message'.format(proc_id))
@@ -120,12 +121,12 @@ def pipe_request(socks, ssl_cert, auth_script):
             break
 
 
-def pipe_response(socks):
+def pipe_response(socks, max_chain):
     proc_id = '({}) {}'.format(id(getcurrent()), socks['server'].getpeername())
     input_buf = bytearray()
     while True:
         try:
-            if pull_entire_message(socks['server'], input_buf):
+            if pull_entire_message(socks['server'], input_buf, max_chain):
                 if not input_buf:
                     # empty message
                     logging.debug('{}: empty message'.format(proc_id))
@@ -163,7 +164,7 @@ def fill_buffer(sock, buffer, offset, size, next_size=0):
 
 
 # pulls postgresql messages from socket with automatic chainloading
-def pull_entire_message(sock, buffer):
+def pull_entire_message(sock, buffer, max_chain):
     start_offset = 0
     buffer.clear()
     buffer.extend(MESSAGE_HEADER_SIZE*b'\x00')
@@ -177,7 +178,9 @@ def pull_entire_message(sock, buffer):
                 # add MESSAGE_HEADER_SIZE bytes to end of buffer to allow for chainloading
                 buffer.extend(b'\x00'*MESSAGE_HEADER_SIZE)
                 
-                result = fill_buffer(sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=MESSAGE_HEADER_SIZE)
+                # only attempt a message chainload if we're out of buffer space
+                next_size = 0 if (len(buffer) > max_chain) else MESSAGE_HEADER_SIZE
+                result = fill_buffer(sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=next_size)
                 if result == 2:
                     # more messages, chainload!
                     start_offset += message_size
@@ -199,6 +202,7 @@ if __name__ == '__main__':
     args = docopt(__doc__, version='pg_scofflaw v0.1a1')
 
     timeout = float(args['--timeout'])
+    max_chain = int(args['--max-chain'])
     upstream = args['--upstream']
     if not os.path.exists(upstream):
         upstream = upstream.split(':', 1)
@@ -228,8 +232,8 @@ if __name__ == '__main__':
         socks = {'client': client_socket, 'server': pg_socket}
         name = socks['client'].getpeername()
         joinall((
-            Greenlet.spawn(pipe_request, socks, ssl_cert, auth_script),
-            Greenlet.spawn(pipe_response, socks)
+            Greenlet.spawn(pipe_request, socks, ssl_cert, auth_script, max_chain),
+            Greenlet.spawn(pipe_response, socks, max_chain)
         ))
         logging.debug('killed connection {}'.format(name))
         pg_socket.close()
