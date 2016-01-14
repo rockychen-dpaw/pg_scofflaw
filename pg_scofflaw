@@ -1,0 +1,239 @@
+#!/usr/bin/env python
+"""
+Custom authentication proxy for PostgreSQL.
+
+Usage: pg_scofflaw [--upstream <server:port/socket file> --listen <ip:port> --auth-script <script> --ssl <certfile> --timeout <length> --verbosity <loglevel>]
+
+Options:
+  --upstream <server:port/socket file>  PostgreSQL server to proxy [default: /var/run/postgresql/.s.PGSQL.5432]
+  --listen <ip:port>                    Interface to listen on [default: 0.0.0.0:6000]
+  --auth-script <script>                Process to call with arguments: ip, user, database
+                                        Must return 0 if authenticated, non-zero if failed.
+                                        [default: true]
+  --ssl <certfile>                      Accept SSL requests (TLSv1)
+  --timeout <length>                    Time to live in seconds [default: 3600] 
+  --verbosity <loglevel>                Amount of detail to output [default: INFO]
+"""
+
+from docopt import docopt
+from gevent import socket, server, sleep, ssl, Greenlet, joinall, getcurrent
+import io
+import logging
+import os
+import subprocess
+
+# copied from mrcrowbar
+import struct
+
+# valid in-session messages begin with one of the following tokens
+MESSAGE_TOKENS = set((x for x in b'123cdfnpstABCDEFGHIKNPQRSTVWXZ'))
+
+# messages begin with a token byte + int32 message size
+MESSAGE_HEADER_SIZE = 5
+
+# valid session initiation messages begin with the following tokens
+TOKEN_SSL_REQUEST = b'\x04\xd2\x16/'
+TOKEN_STARTUP_MESSAGE = b'\x00\x03\x00\x00'
+TOKEN_CANCEL_REQUEST = b'\x04\xd2\x16.'
+
+from_byte_type =    lambda format, size, buffer: struct.unpack( format, buffer[:size] )[0]
+to_byte_type =      lambda format, value: struct.pack( format, value )
+
+from_int32_be =     lambda buffer: from_byte_type( '>i', 4, buffer )
+to_int32_be =       lambda value: to_byte_type( '>i', value )
+
+
+def authenticate(auth_script, host, role, db):
+    return subprocess.call([auth_script, host, role, db]) == 0
+
+def gen_fatal(message):
+    error_body = b'SFATAL\x00C28000\x00M'+message+b'\x00\x00'
+    error_full = b'E' + to_int32_be(len(error_body)+4) + error_body
+    return error_full
+
+def pipe_request(socks, ssl_cert, auth_script):
+    auth_mode = True
+
+    proc_id = '({}) {}'.format(id(getcurrent()), socks['client'].getpeername())
+    input_buf = bytearray()
+    while True:
+        try:
+            if auth_mode:
+                data = socks['client'].recv(io.DEFAULT_BUFFER_SIZE)
+                if data:
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug('{}: request {}'.format(proc_id, repr(data)))
+                    msg_size_bytes = from_int32_be( data[:4] )-4
+                    msg = data[4:4+msg_size_bytes]
+
+                    if msg[:4] == TOKEN_SSL_REQUEST:
+                        if (ssl_cert):
+                            logging.debug('{}: SSLRequest detected; shimming'.format(proc_id))
+                            client_raw = socks['client']
+                            client_raw.send(b'S')
+                            socks['client'] = ssl.wrap_socket(client_raw, do_handshake_on_connect=False, server_side=True, certfile=ssl_cert, ssl_version=ssl.PROTOCOL_TLSv1)
+                            logging.debug('({}) pg_scofflaw: b\'S\''.format(id(getcurrent())))
+                        else:
+                            logging.debug('{}: SSLRequest detected; blackholing'.format(proc_id))
+                            socks['client'].send(b'N')
+                            logging.debug('({}) pg_scofflaw: b\'N\''.format(id(getcurrent())))
+
+                    elif msg[:4] == TOKEN_STARTUP_MESSAGE:
+                        logging.debug('{}: StartupMessage detected; stealing'.format(proc_id))
+                        params = [x for x in msg[4:].split(b'\x00') if x]
+                        params = dict(zip(params[::2], params[1::2]))
+                        logging.debug('{}: {}'.format(proc_id, params))
+                        if (b'user' in params) and (b'database' in params) and authenticate(auth_script, socks['client'].getpeername()[0], params[b'user'].decode('utf8'), params[b'database'].decode('utf8')):
+                            logging.info('{}: authorised with user {}'.format(proc_id, params[b'user']))
+                            auth_mode = False
+                            socks['server'].send(data)
+                        else:
+                            # bomb out
+                            logging.info('{}: failed to authorize with user {}'.format(proc_id, params[b'user']))
+                            error_full = gen_fatal(b'Custom auth failed!')
+                            socks['client'].send(error_full)
+                            logging.debug('({}) pg_scofflaw: {}'.format(id(getcurrent()), error_full))
+
+                    elif msg[:4] == TOKEN_CANCEL_REQUEST:
+                        logging.debug('{}: CancelRequest detected; passing on'.format(proc_id))
+                        socks['server'].send(data)
+
+                    else:   # play dumb and eat the handshake request if using an older protocol
+                        logging.error('{}: no idea what this is!'.format(proc_id))
+                        error_full = gen_fatal(b'Unknown startup message, possibly an old client?')
+                        socks['client'].send(error_full)
+                        logging.debug('({}) pg_scofflaw: {}'.format(id(getcurrent()), error_full))
+                    
+            else:
+                if pull_entire_message(socks['client'], input_buf):
+                    if not input_buf:
+                        # empty message
+                        logging.debug('{}: empty message'.format(proc_id))
+                        break
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug('{}: {}'.format(proc_id, repr(input_buf)))
+                    socks['server'].sendall(input_buf)
+                else:
+                    logging.error('{}: unknown message! {}'.format(proc_id, input_buf))
+                    break
+        except socket.error:
+            break
+
+
+def pipe_response(socks):
+    proc_id = '({}) {}'.format(id(getcurrent()), socks['server'].getpeername())
+    input_buf = bytearray()
+    while True:
+        try:
+            if pull_entire_message(socks['server'], input_buf):
+                if not input_buf:
+                    # empty message
+                    logging.debug('{}: empty message'.format(proc_id))
+                    break
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    logging.debug('{}: {}'.format(proc_id, repr(input_buf)))
+                socks['client'].sendall(input_buf)
+            else:
+                logging.error('{}: unknown message! {}'.format(proc_id, input_buf))
+                break
+        except socket.error:
+            break
+
+
+# persistently try to copy [size] bytes from a socket into buffer[offset:offset+size] 
+# if next_size is defined, ask for [size+next_size] bytes, but return 1 if only [size]
+# bytes come back. otherwise return 2, to indicate message chainloading.
+# return 0 if zero-length message was received (EOL)
+def fill_buffer(sock, buffer, offset, size, next_size=0):
+    remainder = size+next_size
+    buffer_view = memoryview(buffer)
+    tries = 0
+    while remainder > 0:
+        rem_size = sock.recv_into(buffer_view[offset+size+next_size-remainder:], remainder)
+        remainder -= rem_size
+        if (rem_size == 0 and tries == 0):# or (tries > FILL_BUFFER_MAX_RETRIES):
+            # give up
+            return 0
+        elif remainder == next_size:
+            buffer_view.release()
+            return 1
+        tries += 1
+    buffer_view.release()
+    return 2
+
+
+# pulls postgresql messages from socket with automatic chainloading
+def pull_entire_message(sock, buffer):
+    start_offset = 0
+    buffer.clear()
+    buffer.extend(MESSAGE_HEADER_SIZE*b'\x00')
+    if fill_buffer(sock, buffer, start_offset, MESSAGE_HEADER_SIZE):  # we got a header's worth of bytes
+        while True:
+            if buffer[start_offset] in MESSAGE_TOKENS:
+                message_size = from_int32_be( buffer[start_offset+1:start_offset+5] )+1
+                # grow buffer to fit the current message
+                if message_size > MESSAGE_HEADER_SIZE:
+                    buffer.extend(b'\x00'*(message_size-MESSAGE_HEADER_SIZE))
+                # add MESSAGE_HEADER_SIZE bytes to end of buffer to allow for chainloading
+                buffer.extend(b'\x00'*MESSAGE_HEADER_SIZE)
+                
+                result = fill_buffer(sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=MESSAGE_HEADER_SIZE)
+                if result == 2:
+                    # more messages, chainload!
+                    start_offset += message_size
+                    continue
+                else:
+                    # end of message stream, trim extra [MESSAGE_HEADER_SIZE] bytes off the end
+                    del buffer[start_offset+message_size:]
+                    return True
+            else:
+                # unknown message ID, abort!
+                return False
+    else:               
+        # buffer is empty, we're fine
+        del buffer[0:]
+        return True
+
+
+if __name__ == '__main__':
+    args = docopt(__doc__, version='pg_scofflaw v0.1a1')
+
+    timeout = float(args['--timeout'])
+    upstream = args['--upstream']
+    if not os.path.exists(upstream):
+        upstream = upstream.split(':', 1)
+        upstream = (upstream[0], int(upstream[1]) if (len(upstream)>1) else 5432)
+    listen = args['--listen'].split(':', 1)
+    listen = (listen[0], int(listen[1]) if (len(listen)>1) else 6000)
+    ssl_cert = args['--ssl']
+    auth_script = args['--auth-script']
+
+    logging.basicConfig(
+        level=args['--verbosity'].upper(),
+        format = '%(asctime)s %(levelname)s %(message)s'
+    )
+
+    def create_pg_socket():
+        if os.path.exists(upstream):
+            pg_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            pg_socket.connect(upstream)
+        else:
+            pg_socket = socket.create_connection(upstream)
+        return pg_socket
+
+    def pg_proxy(client_socket, address):
+        pg_socket = create_pg_socket()
+        pg_socket.settimeout(timeout)
+        client_socket.settimeout(timeout)
+        socks = {'client': client_socket, 'server': pg_socket}
+        name = socks['client'].getpeername()
+        joinall((
+            Greenlet.spawn(pipe_request, socks, ssl_cert, auth_script),
+            Greenlet.spawn(pipe_response, socks)
+        ))
+        logging.debug('killed connection {}'.format(name))
+        pg_socket.close()
+        client_socket.close()
+
+    s = server.StreamServer(listen, pg_proxy)
+    s.serve_forever()
