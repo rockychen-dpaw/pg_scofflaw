@@ -112,13 +112,13 @@ def pipe_request(socks, ssl_cert, auth_script, max_chain):
                         logging.debug('({}) pg_scofflaw: {}'.format(id(getcurrent()), error_full))
                     
             else:
-                if pull_entire_message(proc_id,socks['client'], input_buf, max_chain):
+                if pull_entire_message(proc_id, socks['client'], input_buf, max_chain):
                     if not input_buf:
                         # empty message
                         logging.debug('{}: empty message'.format(proc_id))
                         break
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug('{}: send message to server (size = {})'.format(proc_id, repr(input_buf)))
+                        logging.debug('{}: send message to server (size = {})'.format(proc_id, len(input_buf)))
                     socks['server'].sendall(input_buf)
                 else:
                     logging.error('{}: unknown message! {}'.format(proc_id, input_buf))
@@ -132,7 +132,7 @@ def pipe_response(socks, max_chain):
     input_buf = bytearray()
     while True:
         try:
-            if pull_entire_message(proc_id,socks['server'], input_buf, max_chain):
+            if pull_entire_message(proc_id, socks['server'], input_buf, max_chain):
                 if not input_buf:
                     # empty message
                     logging.debug('{}: empty message'.format(proc_id))
@@ -151,7 +151,7 @@ def pipe_response(socks, max_chain):
 # if next_size is defined, ask for [size+next_size] bytes, but return 1 if only [size]
 # bytes come back. otherwise return 2, to indicate message chainloading.
 # return 0 if zero-length message was received (EOL)
-def fill_buffer(proc_id,sock, buffer, offset, size, next_size=0):
+def fill_buffer(proc_id, sock, buffer, offset, size, next_size=0):
     remainder = size+next_size
     buffer_view = memoryview(buffer)
     tries = 0
@@ -177,11 +177,11 @@ def fill_buffer(proc_id,sock, buffer, offset, size, next_size=0):
 
 
 # pulls postgresql messages from socket with automatic chainloading
-def pull_entire_message(proc_id,sock, buffer, max_chain):
+def pull_entire_message(proc_id, sock, buffer, max_chain):
     start_offset = 0
     buffer.clear()
     buffer.extend(MESSAGE_HEADER_SIZE*b'\x00')
-    if fill_buffer(proc_id,sock, buffer, start_offset, MESSAGE_HEADER_SIZE):  # we got a header's worth of bytes
+    if fill_buffer(proc_id, sock, buffer, start_offset, MESSAGE_HEADER_SIZE):  # we got a header's worth of bytes
         while True:
             if buffer[start_offset] in MESSAGE_TOKENS:
                 message_size = from_int32_be( buffer[start_offset+1:start_offset+5] )+1
@@ -193,10 +193,14 @@ def pull_entire_message(proc_id,sock, buffer, max_chain):
                 
                 # only attempt a message chainload if we haven't hit the chain size limit
                 next_size = 0 if (len(buffer) > max_chain) else MESSAGE_HEADER_SIZE
-                result = fill_buffer(proc_id,sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=next_size)
+                result = fill_buffer(proc_id, sock, buffer, start_offset+MESSAGE_HEADER_SIZE, (message_size-MESSAGE_HEADER_SIZE), next_size=next_size)
                 if result == 2:
                     # more messages, chainload!
                     start_offset += message_size
+                    # except if the next message is exactly 4 bytes long! that would mean
+                    # the chainloader has already picked it up, and we should flush the pipeline.
+                    if from_int32_be(buffer[start_offset+1:])-4 == 0:
+                        return True
                     continue
                 else:
                     # end of message stream, trim extra [MESSAGE_HEADER_SIZE] bytes off the end
